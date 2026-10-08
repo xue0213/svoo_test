@@ -76,6 +76,8 @@ Profiling prompts live in `data/profile_data/prompt.txt`. See `scripts/offline/R
 
 ## Inference
 
+For the Ascend 910C Wan2.1 T2V 1.3B reference port, see [README_NPU.md](README_NPU.md). It uses a separate NPU entrypoint and preserves SVOO routing without CUDA extensions; hardware validation is still required.
+
 Wan 14B/A14B and HunyuanVideo 720p inference require an 80GB GPU; Wan2.1-T2V-1.3B can run on 40GB GPUs.
 
 | Task | Command |
