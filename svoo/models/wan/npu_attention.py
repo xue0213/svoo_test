@@ -147,7 +147,7 @@ class WanNPUProcessor:
                  chunk=256, top_p=0.9, min_ratio=0.1, profile=None,
                  ratio_min=0.15, ratio_max=0.20, fp_steps=10, fp_layers=1,
                  reuse_start=11, reuse_interval=20, iters_init=None, iters_step=None,
-                 fp_timestep=None):
+                 fp_timestep=None, heatmaps=None):
         self.layer, self.sparse = layer, sparse
         self.qc, self.kc, self.iters, self.chunk = qc, kc, iters, chunk
         self.top_p, self.min_ratio = top_p, min_ratio
@@ -160,6 +160,9 @@ class WanNPUProcessor:
         self.iters_step = iters if iters_step is None else iters_step
         self.initialized = False
         self.fp_timestep, self.current_timestep = fp_timestep, None
+        self.heatmaps = heatmaps
+        self.token_grid = None
+        self._heatmap_step, self._heatmap_calls = None, 0
 
     def _ratios(self, b, h):
         keys = [(self.step, self.layer, head) for head in range(h)]
@@ -171,6 +174,10 @@ class WanNPUProcessor:
         ]
 
     def _self_attention(self, q, k, v):
+        if self.heatmaps is not None:
+            if self._heatmap_step != self.step:
+                self._heatmap_step, self._heatmap_calls = self.step, 0
+            self._heatmap_calls += 1
         if self.sparse and q.shape[0] != 1:
             raise ValueError("Original Wan SVOO requires batch size 1")
         if self.fp_timestep is not None and self.current_timestep is None:
@@ -199,6 +206,12 @@ class WanNPUProcessor:
         else:
             _trace(f"{tag} reuse cached clustering")
         ql, qcent, _, kl, kcent, ks = self.cache[1]
+        if self.heatmaps is not None:
+            if self.token_grid is None:
+                raise RuntimeError("Heatmap capture requires the transformer token grid")
+            # Diffusers 0.36 WanPipeline calls cond first, then uncond per step.
+            branch = "positive" if self._heatmap_calls == 1 else "negative"
+            self.heatmaps.capture(self.layer, self.step, branch, q, k, ql, kl, self.token_grid)
         _trace(f"{tag} block selection begin")
         blocks = select_blocks(qcent, kcent, ks, self.top_p, self._ratios(b, h))
         _trace(f"{tag} sparse attention begin")

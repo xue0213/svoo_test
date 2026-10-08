@@ -19,6 +19,10 @@ def parse_args():
     p.add_argument("--num_inference_steps", type=int, default=50)
     p.add_argument("--output_file", default="result/npu/wan.mp4")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--heatmap_dir", type=Path, help="Enable pooled QK before/after clustering plots")
+    p.add_argument("--heatmap_seed", type=int, default=0, help="Independent seed for selecting seven layers")
+    p.add_argument("--heatmap_branch", choices=("positive", "negative", "both"), default="positive")
+    p.add_argument("--heatmap_step", type=int, help="One-based diffusion step; default first sparse visit per layer")
     p.add_argument("--cpu_offload", action="store_true")
     p.add_argument("--vae_tiling", action="store_true")
     p.add_argument("--num_q_centroids", type=int, default=256)
@@ -54,6 +58,11 @@ def parse_args():
         p.error("Warmup fractions must be in [0,1]")
     if not 0 <= a.dynamic_min_kc_ratio_min <= a.dynamic_min_kc_ratio_max <= 1:
         p.error("Profile clipping bounds must satisfy 0 <= min <= max <= 1")
+    if a.heatmap_dir is not None:
+        if a.attention != "svoo":
+            p.error("Heatmaps require --attention svoo to capture actual clustering")
+        if a.heatmap_step is not None and not 1 <= a.heatmap_step <= a.num_inference_steps:
+            p.error("--heatmap_step must be within the inference step range")
     return a
 
 
@@ -86,6 +95,24 @@ def main():
     profile = load_profile(args.sparsity_csv_path)
     # Match the original entrypoint: all loaded components, including VAE, use BF16.
     pipe = WanPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
+    heatmaps = None
+    if args.heatmap_dir is not None:
+        from svoo.attention_heatmaps import AttentionHeatmaps
+        heatmaps = AttentionHeatmaps(
+            args.heatmap_dir, pipe.transformer.config.num_layers, seed=args.heatmap_seed,
+            branch=args.heatmap_branch, step=args.heatmap_step,
+            metadata=dict(prompt=args.prompt, negative_prompt=args.negative_prompt,
+                          model_id=args.model_id, generation_seed=args.seed,
+                          torch_version=str(torch.__version__), torch_npu_version=str(torch_npu.__version__),
+                          height=args.height, width=args.width, num_frames=args.num_frames,
+                          inference_steps=args.num_inference_steps, qc=args.num_q_centroids,
+                          kc=args.num_k_centroids, kmeans_iter_init=args.kmeans_iter_init,
+                          kmeans_iter_step=args.kmeans_iter_step, first_times_fp=args.first_times_fp,
+                          first_layers_fp=args.first_layers_fp, start_reuse_step=args.start_reuse_step,
+                          reuse_interval=args.reuse_interval,
+                          sparsity_csv_path=str(args.sparsity_csv_path), top_p=args.top_p_kmeans,
+                          pooling_note="latent frames, not decoded video frames"),
+        )
     scheduler = deepcopy(pipe.scheduler)
     scheduler.set_timesteps(args.num_inference_steps)
     warmup_steps = math.floor(args.first_times_fp * args.num_inference_steps)
@@ -98,6 +125,7 @@ def main():
         fp_steps=warmup_steps, fp_timestep=fp_timestep,
         fp_layers=math.floor(args.first_layers_fp * pipe.transformer.config.num_layers),
         reuse_start=args.start_reuse_step, reuse_interval=args.reuse_interval,
+        heatmaps=heatmaps,
     )
     def capture_timestep(module, positional, keyword):
         timestep = keyword.get("timestep")
@@ -108,6 +136,13 @@ def main():
         value = float(timestep.flatten()[0])
         for processor in processors:
             processor.current_timestep = value
+        if heatmaps is not None:
+            hidden = keyword.get("hidden_states")
+            if hidden is None:
+                hidden = positional[0]
+            grid = tuple(int(s // p) for s, p in zip(hidden.shape[-3:], module.config.patch_size))
+            for processor in processors:
+                processor.token_grid = grid
     pipe.transformer.register_forward_pre_hook(capture_timestep, with_kwargs=True)
     if getattr(pipe, "transformer_2", None) is not None:
         pipe.transformer_2.register_forward_pre_hook(capture_timestep, with_kwargs=True)
@@ -133,6 +168,8 @@ def main():
         kwargs["guidance_scale_2"] = 3.0
     with torch.inference_mode():
         frames = pipe(**kwargs).frames[0]
+    if heatmaps is not None:
+        heatmaps.finish()
     output = Path(args.output_file)
     output.parent.mkdir(parents=True, exist_ok=True)
     export_to_video(frames, str(output), fps=16)

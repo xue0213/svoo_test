@@ -168,6 +168,74 @@ the command. One passing fixture does not prove full model equivalence;
 representative per-step/per-layer real Q/K/V and final latent/video comparisons
 are still needed. CUDA/NPU parity has **not** been run in this workspace.
 
+## Q/K clustering heatmaps
+
+Add `--heatmap_dir result/npu/heatmaps` to a normal `--attention svoo`
+inference command. For example, retain the model path and generation parameters
+you are already testing and append:
+
+```bash
+--heatmap_dir result/npu/heatmaps --heatmap_seed 0
+```
+
+Install `matplotlib` if it is missing (`python -m pip install matplotlib`).
+Seven layers are sampled from the transformer's layer indices using an
+independent random generator; Wan 1.3B has thirty layers and twelve heads.
+The chosen zero-based indices are printed and saved in `manifest.json`.
+The default captures each selected layer's first sparse visit for the positive
+prompt. With the default fifty-step schedule this is normally step eleven.
+`--heatmap_step 31` selects a particular one-based step instead; it must be a
+sparse step. `--heatmap_branch both` also captures the negative-prompt branch,
+in separate directories. Branch identification follows Diffusers 0.36.0
+WanPipeline's conditional-then-unconditional transformer call order. This
+entrypoint has batch size one and guidance enabled. Reused clustering steps
+plot the actual cached routing rather than running a new clustering analysis.
+
+Each `step_011/positive/layer_XX/head_YY.png` compares:
+
+- Left: FP32 post-RoPE `QK^T/sqrt(head_dim)` scores in original token order,
+  averaged over every pair of latent-frame token blocks.
+- Right: the same Q/K sorted independently by their clustering labels, then
+  averaged over equal-size blocks containing one original frame's token count.
+  These sorted blocks mix original frame identities. They are not real frames.
+- Both panels share a symmetric color scale per head. The values are raw
+  pre-softmax logits, not attention probabilities, masked logits, or centroids.
+
+The mean score is computed as `mean(Q_block) @ mean(K_block).T / sqrt(d)`.
+This equals the mean of the full block's logits in real arithmetic, without
+allocating the token-by-token score matrix. The analysis uses FP32 and does not
+reproduce BF16 matmul rounding. Each full head is copied to CPU in turn;
+rendering adds synchronization, CPU work, and I/O but does not modify routing,
+Q/K, or the inference RNG. Generation throughput must be measured with capture
+disabled. Pooling may hide fine cluster structure; it is not an unpooled view.
+
+For 81 decoded video frames, the usual Wan latent token grid has 21 temporal
+slices, so the pooled images are 21-by-21, not 81-by-81. Each `.npz` includes
+`before`, `after`, Q/K labels, permutation indices, exact cluster boundaries,
+token grid, and pooling block size. Plotted cluster boundaries are quantized
+to the pooled grid; exact boundaries are retained in the data. The manifest
+records the prompt, model, generation seed, selected layers and captured steps.
+Use a fresh output directory for each prompt/run to avoid overwriting files.
+If selected layers remain dense or the requested step is not reached, a final
+warning lists missing captures. Heatmaps do not require new offline calibration,
+but this inference command continues to use the existing CSV policy normally.
+
+The small 256x256x9 two-step smoke command can exercise plotting with
+`--first_times_fp 0 --first_layers_fp 0`; it produces a 3-by-3 pooled view and
+is not a quality or representative-pattern evaluation. Full-size sparse
+inference remains slow in this reference backend; enabling plots does not
+remove that bottleneck.
+
+```bash
+python -m unittest discover -s tests -p test_attention_heatmaps.py -v
+```
+
+All twenty local tests (six visualization tests plus fourteen attention tests)
+passed in BF16 CPU mode. Visualization tests check full-score block means,
+permutation semantics, branch/step filtering, output artifacts, and unchanged
+inference outputs and random states. Actual 910C plotting remains to be tested
+on the server.
+
 ## Local validation
 
 With the default 50-step run, dense warmup ends after ten steps. The progress
