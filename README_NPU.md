@@ -120,6 +120,9 @@ Those deviations have now been removed:
 
 - CUDA and NPU call the same original `weighted_softmax` and
   `identify_dynamic_map` functions in `svoo/routing.py`.
+- On NPU, the top-p threshold is explicitly converted to the cumulative
+  probability dtype before comparison. This preserves the original BF16
+  scalar rounding boundary; CPU/CUDA continue using the original expression.
 - Centroids retain the input BF16 dtype; updates accumulate in FP32 then cast
   back, with INT32 counts and the original empty-cluster behavior.
 - Centroid profiles use the original BF16 matmul followed by FP32 L2 norm;
@@ -167,7 +170,7 @@ are still needed. CUDA/NPU parity has **not** been run in this workspace.
 
 ## Local validation
 
-Thirteen tests passed in both FP32 and BF16 CPU modes, including masked-attention
+The initial thirteen tests passed in both FP32 and BF16 CPU modes, including masked-attention
 equivalence, clustering/chunking, warmup/reuse, the native Wan processor
 comparison, and a tiny Wan transformer forward in dense and sparse modes.
 Local versions: PyTorch 2.6.0+cpu, Diffusers 0.36.0, Transformers 4.51.3,
@@ -176,6 +179,20 @@ Accelerate 1.7.0. This is not validation of the supplied 910C/CANN 8.5 stack.
 ```bash
 SVOO_TEST_DTYPE=bf16 python -m unittest discover -s tests -p test_npu_attention.py -v
 ```
+
+To inspect a BF16 top-p boundary failure on Ascend, run:
+
+```bash
+python scripts/diagnose_npu_routing.py --device npu:0
+```
+
+The boundary fixture should select all three clusters. In particular, the
+second cumulative probability and the BF16 threshold both round to
+`0.66796875`. The diagnostic also prints the raw Python-scalar comparison,
+which can differ on NPU; routing now uses the explicit typed threshold there.
+The additional boundary regression checks several head counts and thresholds
+against the original CPU policy. All fourteen tests passed locally in BF16 CPU
+mode after the threshold change. Hardware validation remains required.
 
 ## References
 

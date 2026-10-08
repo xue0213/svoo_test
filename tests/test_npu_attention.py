@@ -175,6 +175,19 @@ class AttentionTests(unittest.TestCase):
                              0.6661, 0)
         self.assertTrue(bool(mask.all()))
 
+    def test_bf16_top_p_boundary_matches_cpu(self):
+        # Compare with the original CPU scalar policy across both sides of
+        # the BF16 rounding boundary and several batch/head shapes.
+        for heads in (1, 2, 12):
+            centers = torch.zeros(heads, 3, 128, dtype=torch.bfloat16)
+            counts = torch.ones(heads, 3, dtype=torch.int32)
+            for threshold in (0.664, 0.6661, 0.668, 0.67):
+                with self.subTest(heads=heads, threshold=threshold):
+                    expected = select_blocks(centers[:, :1], centers, counts, threshold, 0)
+                    actual = select_blocks(centers[:, :1].to(DEVICE), centers.to(DEVICE),
+                                           counts.to(DEVICE), threshold, 0)
+                    torch.testing.assert_close(actual.cpu(), expected)
+
     def test_top_p_one_still_runs_original_clustering(self):
         q, k, v = self.q[:1], self.k[:1], self.v[:1]
         p = WanNPUProcessor(0, sparse=True, qc=4, kc=7,

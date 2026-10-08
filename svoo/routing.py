@@ -43,7 +43,14 @@ def identify_dynamic_map(
     sorted_probs, sorted_indices = torch.sort(weighted_attn_probs, dim=-1, descending=True)
 
     cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-    remove_indices = cumsum_probs > p
+    # CPU/CUDA wrap the Python scalar in the BF16 tensor's dtype. NPU scalar
+    # comparison can instead compare against the unrounded FP32 threshold.
+    # Materialize the threshold to preserve the original BF16 top-p boundary.
+    threshold = (
+        torch.tensor(p, dtype=cumsum_probs.dtype, device=device)
+        if device.type == "npu" else p
+    )
+    remove_indices = cumsum_probs > threshold
     remove_indices[..., 1:] = remove_indices[..., :-1].clone()
     remove_indices[..., 0] = False
 
