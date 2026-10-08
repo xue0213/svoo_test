@@ -170,6 +170,18 @@ are still needed. CUDA/NPU parity has **not** been run in this workspace.
 
 ## Local validation
 
+With the default 50-step run, dense warmup ends after ten steps. The progress
+bar can remain at 10/50 while the first sparse step runs. Full 720x1280x81
+generation has about 75,600 tokens, and this gathered reference backend launches
+attention separately for each nonempty query cluster in each head. A successful
+small smoke test does not establish practical throughput at this size.
+
+Set `SVOO_TRACE=1` before the inference command to print step/layer, clustering,
+block-selection and per-head sparse-attention progress. Report the last log line
+and `npu-smi info` when diagnosing a stall. Timings measure host dispatch and
+incidental synchronization, not synchronized NPU kernel time; tracing adds no
+explicit device synchronization and does not change routing.
+
 The initial thirteen tests passed in both FP32 and BF16 CPU modes, including masked-attention
 equivalence, clustering/chunking, warmup/reuse, the native Wan processor
 comparison, and a tiny Wan transformer forward in dense and sparse modes.

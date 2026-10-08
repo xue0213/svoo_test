@@ -7,10 +7,17 @@ The gathered-cluster implementation prioritizes correctness over throughput.
 CPU execution is supported for tests; production inference uses torch_npu.
 """
 import csv
+import os
+import time
 
 import torch
 import torch.nn.functional as F
 from svoo.routing import identify_dynamic_map
+
+
+def _trace(message):
+    if os.environ.get("SVOO_TRACE") == "1":
+        print(f"[SVOO] {message}", flush=True)
 
 
 def dense_attention(q, k, v):
@@ -100,6 +107,8 @@ def gathered_sparse_attention(q, k, v, ql, kl, blocks):
     # tie order remains backend dependent, as in torch.argsort itself.
     qorder, korder = ql.argsort(dim=-1).cpu(), kl.argsort(dim=-1).cpu()
     for bh in range(b * h):
+        head_start = time.perf_counter()
+        _trace(f"sparse head={bh + 1}/{b * h} begin, query_clusters={blocks.shape[1]}")
         for cluster in range(blocks.shape[1]):
             qi = qorder[bh][qcpu[bh, qorder[bh]] == cluster]
             if qi.numel() == 0:
@@ -114,6 +123,7 @@ def gathered_sparse_attention(q, k, v, ql, kl, blocks):
                 vf[bh].index_select(0, ki)[None, None],
             )[0, 0]
             out[bh].index_copy_(0, qi, output)
+        _trace(f"sparse head={bh + 1}/{b * h} dispatched, elapsed={time.perf_counter() - head_start:.1f}s")
     return out.reshape(b, h, n, d)
 
 
@@ -170,20 +180,31 @@ class WanNPUProcessor:
         if not self.sparse or warmup or self.layer < self.fp_layers:
             return dense_attention(q, k, v)
         b, h, n, d = q.shape
+        started = time.perf_counter()
+        tag = f"step={self.step} layer={self.layer} tokens={n} heads={h}"
+        _trace(f"{tag} begin")
         recluster = (
             self.cache is None or self.cache[0] != tuple(q.shape)
             or self.step < self.reuse_start
             or (self.step - self.reuse_start) % self.reuse_interval == 0
         )
         if recluster:
+            _trace(f"{tag} clustering begin, qc={self.qc} kc={self.kc} chunk={self.chunk}")
             result = co_cluster(q.reshape(b*h, n, d), k.reshape(b*h, n, d),
                                 self.qc, self.kc,
                                 self.iters_step if self.initialized else self.iters_init, self.chunk)
             self.initialized = True
             self.cache = (tuple(q.shape), result)
+            _trace(f"{tag} clustering dispatched, elapsed={time.perf_counter() - started:.1f}s")
+        else:
+            _trace(f"{tag} reuse cached clustering")
         ql, qcent, _, kl, kcent, ks = self.cache[1]
+        _trace(f"{tag} block selection begin")
         blocks = select_blocks(qcent, kcent, ks, self.top_p, self._ratios(b, h))
-        return gathered_sparse_attention(q, k, v, ql, kl, blocks)
+        _trace(f"{tag} sparse attention begin")
+        output = gathered_sparse_attention(q, k, v, ql, kl, blocks)
+        _trace(f"{tag} dispatched, elapsed={time.perf_counter() - started:.1f}s")
+        return output
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None,
                  attention_mask=None, rotary_emb=None):
